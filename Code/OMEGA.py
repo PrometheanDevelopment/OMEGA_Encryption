@@ -1,24 +1,42 @@
 #!/usr/bin/env python3
 """
-secure_max_postquantum_stack.py
+secure_stack_encryptor.py
 
-Maximum-security hybrid encryptor (classical + post-quantum) built to give
-**the highest practical security today and against future quantum adversaries**.
+A hardened "stacked" hybrid encryption tool that layers modern, well-regarded primitives.
 
-Usage examples
-  # generate maximum-strength keys for identity 'alice'
-  python secure_max_postquantum_stack.py --gen-keys --id alice
+Pipeline (encryption):
+  1) Ephemeral X25519 ECDH -> shared secret
+  2) HKDF(SHA256) derives two independent symmetric keys
+     - Key A -> ChaCha20-Poly1305 (primary AEAD)
+     - Key B -> AES-GCM (secondary AEAD layered on top)
+  3) Sign the final ciphertext with Ed25519 (sender authenticity)
 
-  # encrypt
-  python secure_max_postquantum_stack.py --mode encrypt --infile message.txt \
-      --recipient_x25519_pub alice_x25519_pub.pem --recipient_kyber_pub alice_kyber_pub.bin \
-      --sender_ed_priv bob_ed25519_priv.pem --sender_dilithium_priv bob_dilithium_priv.bin \
-      --outfile out.json
+Decryption reverses the steps and verifies the signature.
+
+Security features:
+  - Uses X25519 (Curve25519) for ECDH (forward secrecy via ephemeral keys).
+  - Uses HKDF to derive independent keys for each AEAD primitive.
+  - Uses ChaCha20-Poly1305 and AES-GCM (two independent AEADs stacked).
+  - Adds Ed25519 signatures for sender authentication and integrity.
+  - Optional Scrypt-based password protection when generating private keys.
+  - Output is a compact JSON blob with base64-encoded fields; safe to transmit.
+
+Dependencies:
+  pip install cryptography
+
+Usage examples:
+  # generate keypairs for recipient (decryption) and sender (signing)
+  python secure_stack_encryptor.py --gen-keys --recipient-id recipient --sender-id sender
+
+  # encrypt a message
+  python secure_stack_encryptor.py --mode encrypt --infile message.txt --recipient recipient_public.pem --sender sender_private.pem --out out.json
 
   # decrypt
-  python secure_max_postquantum_stack.py --mode decrypt --infile out.json \
-      --recipient_x25519_priv alice_x25519_priv.pem --recipient_kyber_priv alice_kyber_priv.bin \
-      --sender_ed_pub bob_ed25519_pub.pem --sender_dilithium_pub bob_dilithium_pub.bin
+  python secure_stack_encryptor.py --mode decrypt --infile out.json --recipient recipient_private.pem --sender sender_public.pem
+
+Notes:
+  - Keep private keys safe. If you protect them with a password when generating, remember the password.
+  - This script aims to be robust and opinionated for demonstration; for production use, prefer well-tested libraries/protocols (libsodium, age, PGP, TLS).
 
 """
 
@@ -26,62 +44,18 @@ import argparse
 import base64
 import json
 import os
-import secrets
 from typing import Tuple
 
 from cryptography.hazmat.primitives.asymmetric import x25519, ed25519
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305, AESGCM
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
+import secrets
 
-# Attempt PQC imports. Prefer highest-strength parameter sets (Kyber1024, Dilithium5)
-PQC_AVAILABLE = False
-KYBER_AVAILABLE = False
-DILITHIUM_AVAILABLE = False
-SPHINCS_AVAILABLE = False
-_pqc_import_error = None
-
-try:
-    # pqcrypto naming varies — try common modules
-    import pqcrypto.kem.kyber1024 as _kyber_mod
-    from pqcrypto.kem.kyber1024 import generate_keypair as kyber_generate, encrypt as kyber_encapsulate, decrypt as kyber_decapsulate
-    KYBER_AVAILABLE = True
-    PQC_AVAILABLE = True
-except Exception as e:
-    _pqc_import_error = e
-    try:
-        import pqcrypto.kem.kyber512 as _kyber_mod
-        from pqcrypto.kem.kyber512 import generate_keypair as kyber_generate, encrypt as kyber_encapsulate, decrypt as kyber_decapsulate
-        KYBER_AVAILABLE = True
-        PQC_AVAILABLE = True
-    except Exception:
-        KYBER_AVAILABLE = False
-
-try:
-    import pqcrypto.sign.dilithium5 as _dil_mod
-    from pqcrypto.sign.dilithium5 import generate_keypair as dilithium_generate, sign as dilithium_sign, verify as dilithium_verify
-    DILITHIUM_AVAILABLE = True
-    PQC_AVAILABLE = True
-except Exception:
-    try:
-        import pqcrypto.sign.dilithium2 as _dil_mod
-        from pqcrypto.sign.dilithium2 import generate_keypair as dilithium_generate, sign as dilithium_sign, verify as dilithium_verify
-        DILITHIUM_AVAILABLE = True
-        PQC_AVAILABLE = True
-    except Exception:
-        DILITHIUM_AVAILABLE = False
-
-# SPHINCS+ via pyspx (hash-based fallback)
-try:
-    import pyspx
-    SPHINCS_AVAILABLE = True
-    PQC_AVAILABLE = True
-except Exception:
-    SPHINCS_AVAILABLE = False
-
-# helpers for base64
+# ----------------- Utility helpers -----------------
 
 def b64(b: bytes) -> str:
     return base64.b64encode(b).decode('ascii')
@@ -89,306 +63,172 @@ def b64(b: bytes) -> str:
 def ub64(s: str) -> bytes:
     return base64.b64decode(s.encode('ascii'))
 
-# ---------------- key generation ----------------
+# ----------------- Key generation / storage -----------------
 
-def save_bytes(path: str, data: bytes):
+def save_private_key_bytes(path: str, data: bytes):
     with open(path, 'wb') as f:
         f.write(data)
 
-def gen_all_keys(prefix: str):
-    # X25519
-    x_priv = x25519.X25519PrivateKey.generate()
-    x_pub = x_priv.public_key()
-    x_priv_pem = x_priv.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8, encryption_algorithm=serialization.NoEncryption())
-    x_pub_pem = x_pub.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)
-    save_bytes(f'{prefix}_x25519_priv.pem', x_priv_pem)
-    save_bytes(f'{prefix}_x25519_pub.pem', x_pub_pem)
+def save_public_key_bytes(path: str, data: bytes):
+    with open(path, 'wb') as f:
+        f.write(data)
 
-    # Ed25519
-    ed_priv = ed25519.Ed25519PrivateKey.generate()
-    ed_pub = ed_priv.public_key()
-    ed_priv_pem = ed_priv.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8, encryption_algorithm=serialization.NoEncryption())
-    ed_pub_pem = ed_pub.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)
-    save_bytes(f'{prefix}_ed25519_priv.pem', ed_priv_pem)
-    save_bytes(f'{prefix}_ed25519_pub.pem', ed_pub_pem)
-
-    # PQC keys
-    if KYBER_AVAILABLE:
-        ky_pub, ky_priv = kyber_generate()
-        save_bytes(f'{prefix}_kyber_pub.bin', ky_pub)
-        save_bytes(f'{prefix}_kyber_priv.bin', ky_priv)
+def gen_keypair_x25519(prefix: str, protect_password: str = None):
+    priv = x25519.X25519PrivateKey.generate()
+    pub = priv.public_key()
+    # serialize
+    priv_bytes = priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    pub_bytes = pub.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    if protect_password:
+        # derive key from password with scrypt and encrypt the PEM with a simple XOR (note: for real use, use proper PEM encryption)
+        # We'll instead store a scrypt-derived key and use it to encrypt the private bytes using ChaCha20Poly1305
+        salt = secrets.token_bytes(16)
+        kdf = Scrypt(salt=salt, length=32, n=2**14, r=8, p=1)
+        key = kdf.derive(protect_password.encode('utf-8'))
+        aead = ChaCha20Poly1305(key)
+        nonce = secrets.token_bytes(12)
+        ciphertext = aead.encrypt(nonce, priv_bytes, None)
+        # store salt|nonce|ciphertext in base64-wrapped JSON
+        payload = {'scrypt_salt': b64(salt), 'nonce': b64(nonce), 'priv_enc': b64(ciphertext)}
+        save_private_key_bytes(f'{prefix}_x25519_priv.json', json.dumps(payload).encode('utf-8'))
     else:
-        print('Warning: Kyber (preferred Kyber1024) not available in environment; PQC KEM will be disabled.')
+        save_private_key_bytes(f'{prefix}_x25519_priv.pem', priv_bytes)
+    save_public_key_bytes(f'{prefix}_x25519_pub.pem', pub_bytes)
+    print(f'Generated X25519 keys: {prefix}_x25519_priv.* , {prefix}_x25519_pub.pem')
 
-    if DILITHIUM_AVAILABLE:
-        dil_pub, dil_priv = dilithium_generate()
-        save_bytes(f'{prefix}_dilithium_pub.bin', dil_pub)
-        save_bytes(f'{prefix}_dilithium_priv.bin', dil_priv)
+def gen_keypair_ed25519(prefix: str, protect_password: str = None):
+    priv = ed25519.Ed25519PrivateKey.generate()
+    pub = priv.public_key()
+    priv_bytes = priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    pub_bytes = pub.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    if protect_password:
+        salt = secrets.token_bytes(16)
+        kdf = Scrypt(salt=salt, length=32, n=2**14, r=8, p=1)
+        key = kdf.derive(protect_password.encode('utf-8'))
+        aead = ChaCha20Poly1305(key)
+        nonce = secrets.token_bytes(12)
+        ciphertext = aead.encrypt(nonce, priv_bytes, None)
+        payload = {'scrypt_salt': b64(salt), 'nonce': b64(nonce), 'priv_enc': b64(ciphertext)}
+        save_private_key_bytes(f'{prefix}_ed25519_priv.json', json.dumps(payload).encode('utf-8'))
     else:
-        print('Warning: Dilithium (preferred Dilithium5) not available; PQC signatures disabled.')
+        save_private_key_bytes(f'{prefix}_ed25519_priv.pem', priv_bytes)
+    save_public_key_bytes(f'{prefix}_ed25519_pub.pem', pub_bytes)
+    print(f'Generated Ed25519 keys: {prefix}_ed25519_priv.* , {prefix}_ed25519_pub.pem')
 
-    if SPHINCS_AVAILABLE:
-        print('SPHINCS+ available as conservative fallback for signatures (via pyspx).')
+# load helpers (support both raw PEM and scrypt-protected JSON)
 
-    print(f'Generated keys with prefix: {prefix}_*')
-
-# ---------------- load helpers ----------------
-
-def load_x25519_public(path: str):
-    return serialization.load_pem_public_key(open(path, 'rb').read(), backend=default_backend())
-
-def load_x25519_private(path: str):
-    return serialization.load_pem_private_key(open(path, 'rb').read(), password=None, backend=default_backend())
-
-def load_ed25519_private(path: str):
-    return serialization.load_pem_private_key(open(path, 'rb').read(), password=None, backend=default_backend())
-
-def load_ed25519_public(path: str):
-    return serialization.load_pem_public_key(open(path, 'rb').read(), backend=default_backend())
-
-# PQC raw loaders
-
-def load_kyber_pub_raw(path: str) -> bytes:
-    return open(path, 'rb').read()
-
-def load_kyber_priv_raw(path: str) -> bytes:
-    return open(path, 'rb').read()
-
-def load_dilithium_pub_raw(path: str) -> bytes:
-    return open(path, 'rb').read()
-
-def load_dilithium_priv_raw(path: str) -> bytes:
-    return open(path, 'rb').read()
-
-# ---------------- derive hybrid keys ----------------
-
-def derive_hybrid_keys(shared_classical: bytes, shared_pqc: bytes = None) -> Tuple[bytes, bytes]:
-    # Combine classical and PQC shared secrets into a single master secret and derive two AEAD keys
-    if shared_pqc is None:
-        master = shared_classical
+def load_x25519_private(path_priv: str, password: str = None) -> x25519.X25519PrivateKey:
+    if path_priv.endswith('.json'):
+        data = json.load(open(path_priv, 'rb'))
+        salt = ub64(data['scrypt_salt'])
+        nonce = ub64(data['nonce'])
+        priv_enc = ub64(data['priv_enc'])
+        if password is None:
+            raise ValueError('Password required to decrypt protected private key')
+        kdf = Scrypt(salt=salt, length=32, n=2**14, r=8, p=1)
+        key = kdf.derive(password.encode('utf-8'))
+        aead = ChaCha20Poly1305(key)
+        priv_bytes = aead.decrypt(nonce, priv_enc, None)
     else:
-        digest = hashes.Hash(hashes.SHA512(), backend=default_backend())
-        digest.update(shared_classical)
-        digest.update(shared_pqc)
-        master = digest.finalize()
-    hkdf1 = HKDF(algorithm=hashes.SHA512(), length=32, salt=None, info=b'hybrid-chacha', backend=default_backend())
-    key_a = hkdf1.derive(master)
-    hkdf2 = HKDF(algorithm=hashes.SHA512(), length=32, salt=None, info=b'hybrid-aes', backend=default_backend())
-    key_b = hkdf2.derive(master)
+        priv_bytes = open(path_priv, 'rb').read()
+    return serialization.load_pem_private_key(priv_bytes, password=None, backend=default_backend())
+
+def load_x25519_public(path_pub: str) -> x25519.X25519PublicKey:
+    data = open(path_pub, 'rb').read()
+    return serialization.load_pem_public_key(data, backend=default_backend())
+
+def load_ed25519_private(path_priv: str, password: str = None) -> ed25519.Ed25519PrivateKey:
+    if path_priv.endswith('.json'):
+        data = json.load(open(path_priv, 'rb'))
+        salt = ub64(data['scrypt_salt'])
+        nonce = ub64(data['nonce'])
+        priv_enc = ub64(data['priv_enc'])
+        if password is None:
+            raise ValueError('Password required to decrypt protected private key')
+        kdf = Scrypt(salt=salt, length=32, n=2**14, r=8, p=1)
+        key = kdf.derive(password.encode('utf-8'))
+        aead = ChaCha20Poly1305(key)
+        priv_bytes = aead.decrypt(nonce, priv_enc, None)
+    else:
+        priv_bytes = open(path_priv, 'rb').read()
+    return serialization.load_pem_private_key(priv_bytes, password=None, backend=default_backend())
+
+def load_ed25519_public(path_pub: str) -> ed25519.Ed25519PublicKey:
+    data = open(path_pub, 'rb').read()
+    return serialization.load_pem_public_key(data, backend=default_backend())
+
+# ----------------- Core hybrid layered encryption -----------------
+
+def derive_keys(shared_secret: bytes) -> Tuple[bytes, bytes]:
+    # Derive two independent 32-byte keys using HKDF with distinct info labels
+    hkdf_a = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b'handshake chacha', backend=default_backend())
+    key_a = hkdf_a.derive(shared_secret)
+    hkdf_b = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b'handshake aes', backend=default_backend())
+    key_b = hkdf_b.derive(shared_secret)
     return key_a, key_b
 
-# ---------------- encryption / decryption ----------------
 
-def encrypt(plaintext: bytes, recipient_x25519_pub_path: str, recipient_kyber_pub_path: str = None,
-            sender_ed_priv_path: str = None, sender_dilithium_priv_path: str = None, use_sphincs: bool = False) -> dict:
-    """Encrypt using hybrid classical + PQC stack with automatic fallback."""
-    
-    # ---- Classical ephemeral ECDH ----
+def encrypt(plaintext: bytes, recipient_pub: x25519.X25519PublicKey, sender_ed_priv: ed25519.Ed25519PrivateKey) -> dict:
+    # ephemeral ECDH
     ephemeral_priv = x25519.X25519PrivateKey.generate()
     ephemeral_pub = ephemeral_priv.public_key()
-    recipient_pub = load_x25519_public(recipient_x25519_pub_path)
-    shared_classical = ephemeral_priv.exchange(recipient_pub)
+    shared = ephemeral_priv.exchange(recipient_pub)
+    key_chacha, key_aes = derive_keys(shared)
 
-    # ---- PQC: Kyber encapsulation ----
-    shared_pqc = None
-    ky_ct = None
-    if KYBER_AVAILABLE and recipient_kyber_pub_path:
-        try:
-            ky_pub = load_kyber_pub_raw(recipient_kyber_pub_path)
-            try:
-                ky_ct, ky_ss = kyber_encapsulate(ky_pub)
-            except TypeError:
-                ky_ss, ky_ct = kyber_encapsulate(ky_pub)
-            shared_pqc = ky_ss
-        except Exception as e:
-            print(f"Warning: Kyber encapsulation failed, falling back to classical only. ({e})")
-            ky_ct = None
-            shared_pqc = None
-
-    # ---- Key derivation ----
-    key_chacha, key_aes = derive_hybrid_keys(shared_classical, shared_pqc)
-
-    # ---- AEAD encryption ----
+    # ChaCha20-Poly1305 encrypt first
     nonce_chacha = secrets.token_bytes(12)
     chacha = ChaCha20Poly1305(key_chacha)
     ct1 = chacha.encrypt(nonce_chacha, plaintext, None)
 
+    # AES-GCM encrypt the result
     nonce_aes = secrets.token_bytes(12)
     aesgcm = AESGCM(key_aes)
     ct2 = aesgcm.encrypt(nonce_aes, ct1, None)
 
-    # ---- Signatures ----
-    ed_sig = None
-    if sender_ed_priv_path:
-        sender_ed_priv = load_ed25519_private(sender_ed_priv_path)
-        ed_sig = sender_ed_priv.sign(ct2)
+    # Sign the final ciphertext (ct2) with sender's Ed25519
+    signature = sender_ed_priv.sign(ct2)
 
-    dil_sig = None
-    if DILITHIUM_AVAILABLE and sender_dilithium_priv_path:
-        try:
-            dil_priv = load_dilithium_priv_raw(sender_dilithium_priv_path)
-            try:
-                dil_sig = dilithium_sign(dil_priv, ct2)
-            except TypeError:
-                dil_sig = dilithium_sign(ct2, dil_priv)
-        except Exception as e:
-            print(f"Warning: Dilithium signing failed, skipping. ({e})")
-
-    sphincs_sig = None
-    if use_sphincs and SPHINCS_AVAILABLE:
-        try:
-            sphincs_sig = pyspx.sphincs.sign(ct2, seed=None)
-        except Exception:
-            sphincs_sig = None
-
-    return {
-        'ephemeral_pub_raw': b64(ephemeral_pub.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )),
-        'kyber_ct': b64(ky_ct) if ky_ct else None,
+    out = {
+        'ephemeral_pub': b64(ephemeral_pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)),
         'nonce_chacha': b64(nonce_chacha),
         'nonce_aes': b64(nonce_aes),
         'ciphertext': b64(ct2),
-        'ed25519_sig': b64(ed_sig) if ed_sig else None,
-        'dilithium_sig': b64(dil_sig) if dil_sig else None,
-        'sphincs_sig': b64(sphincs_sig) if sphincs_sig else None,
-        'aead_stack': ['ChaCha20-Poly1305', 'AES-GCM'],
-        'pqc': {
-            'kyber': 'kyber1024' if KYBER_AVAILABLE else None,
-            'dilithium': 'dilithium5' if DILITHIUM_AVAILABLE else None,
-            'sphincs': 'available' if SPHINCS_AVAILABLE else None
-        }
+        'signature': b64(signature),
+        'sender_pub_ed25519': b64(sender_ed_priv.public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)),
+        'kdf': 'HKDF-SHA256',
+        'aead_stack': ['ChaCha20-Poly1305', 'AES-GCM']
     }
+    return out
 
 
-def decrypt(payload: dict, recipient_x25519_priv_path: str, recipient_kyber_priv_path: str = None,
-            sender_ed_pub_path: str = None, sender_dilithium_pub_path: str = None, use_sphincs: bool = False) -> bytes:
-    """Decrypt using hybrid classical + PQC stack with automatic fallback."""
-
-    ephem_raw = ub64(payload['ephemeral_pub_raw'])
-    ephem_pub = x25519.X25519PublicKey.from_public_bytes(ephem_raw)
-    recipient_priv = load_x25519_private(recipient_x25519_priv_path)
-    shared_classical = recipient_priv.exchange(ephem_pub)
-
-    # ---- PQC decapsulation (Kyber) ----
-    shared_pqc = None
-    ky_ct_b64 = payload.get('kyber_ct')
-    if KYBER_AVAILABLE and ky_ct_b64 and recipient_kyber_priv_path:
-        try:
-            ky_ct = ub64(ky_ct_b64)
-            ky_priv = load_kyber_priv_raw(recipient_kyber_priv_path)
-            try:
-                shared_pqc = kyber_decapsulate(ky_ct, ky_priv)
-            except TypeError:
-                shared_pqc, _ = kyber_decapsulate(ky_ct, ky_priv)
-        except Exception:
-            print("Warning: Kyber decapsulation failed, proceeding with classical only.")
-            shared_pqc = None
-
-    key_chacha, key_aes = derive_hybrid_keys(shared_classical, shared_pqc)
-    ct2 = ub64(payload['ciphertext'])
-
-    # ---- Signature verification ----
-    if sender_ed_pub_path and payload.get('ed25519_sig'):
-        ed_sig = ub64(payload['ed25519_sig'])
-        sender_ed_pub = load_ed25519_public(sender_ed_pub_path)
-        try:
-            sender_ed_pub.verify(ed_sig, ct2)
-        except InvalidSignature:
-            raise ValueError('Ed25519 signature verification failed')
-
-    if DILITHIUM_AVAILABLE and payload.get('dilithium_sig') and sender_dilithium_pub_path:
-        try:
-            dil_pub = load_dilithium_pub_raw(sender_dilithium_pub_path)
-            sig = ub64(payload['dilithium_sig'])
-            try:
-                ok = dilithium_verify(dil_pub, ct2, sig)
-                if not ok:
-                    print("Warning: Dilithium signature invalid, ignoring.")
-            except TypeError:
-                try:
-                    dilithium_verify(sig, dil_pub, ct2)
-                except Exception:
-                    print("Warning: Dilithium signature invalid, ignoring.")
-        except Exception:
-            print("Warning: Dilithium verification skipped due to missing key or failure.")
-
-    if use_sphincs and SPHINCS_AVAILABLE and payload.get('sphincs_sig'):
-        try:
-            sph_sig = ub64(payload['sphincs_sig'])
-            pyspx.sphincs.verify(sph_sig, ct2)
-        except Exception:
-            print("Warning: SPHINCS signature verification failed, ignoring.")
-
-    # ---- AEAD decryption ----
-    nonce_aes = ub64(payload['nonce_aes'])
-    aesgcm = AESGCM(key_aes)
-    ct1 = aesgcm.decrypt(nonce_aes, ct2, None)
-
-    nonce_chacha = ub64(payload['nonce_chacha'])
-    chacha = ChaCha20Poly1305(key_chacha)
-    plaintext = chacha.decrypt(nonce_chacha, ct1, None)
-
-    return plaintext
-
-def decrypt(payload: dict, recipient_x25519_priv_path: str, recipient_kyber_priv_path: str, sender_ed_pub_path: str, sender_dilithium_pub_path: str = None, use_sphincs: bool = False) -> bytes:
-    ephem_raw = ub64(payload['ephemeral_pub_raw'])
-    ephem_pub = x25519.X25519PublicKey.from_public_bytes(ephem_raw)
-    recipient_priv = load_x25519_private(recipient_x25519_priv_path)
-    shared_classical = recipient_priv.exchange(ephem_pub)
-
-    # PQC decapsulation
-    shared_pqc = None
-    if KYBER_AVAILABLE and payload.get('kyber_ct'):
-        ky_ct = ub64(payload['kyber_ct'])
-        ky_priv = load_kyber_priv_raw(recipient_kyber_priv_path)
-        try:
-            ky_ss = kyber_decapsulate(ky_ct, ky_priv)
-        except TypeError:
-            ky_ss, _ = kyber_decapsulate(ky_ct, ky_priv)
-        shared_pqc = ky_ss
-    elif payload.get('kyber_ct'):
-        raise RuntimeError('Cannot decapsulate Kyber ciphertext: Kyber not available')
-
-    key_chacha, key_aes = derive_hybrid_keys(shared_classical, shared_pqc)
+def decrypt(payload: dict, recipient_priv: x25519.X25519PrivateKey, sender_pub: ed25519.Ed25519PublicKey) -> bytes:
+    ephemeral_pub_raw = ub64(payload['ephemeral_pub'])
+    ephemeral_pub = x25519.X25519PublicKey.from_public_bytes(ephemeral_pub_raw)
+    shared = recipient_priv.exchange(ephemeral_pub)
+    key_chacha, key_aes = derive_keys(shared)
 
     ct2 = ub64(payload['ciphertext'])
-
-    # verify Ed25519
-    ed_sig = ub64(payload['ed25519_sig'])
-    sender_ed_pub = load_ed25519_public(sender_ed_pub_path)
+    # verify signature
+    sig = ub64(payload['signature'])
     try:
-        sender_ed_pub.verify(ed_sig, ct2)
+        sender_pub.verify(sig, ct2)
     except InvalidSignature:
-        raise ValueError('Ed25519 signature verification failed')
+        raise ValueError('Invalid signature: sender authenticity cannot be verified')
 
-    # verify Dilithium if present
-    if DILITHIUM_AVAILABLE and payload.get('dilithium_sig'):
-        if not sender_dilithium_pub_path:
-            raise ValueError('Dilithium signature present but sender Dilithium pub not provided')
-        dil_pub = load_dilithium_pub_raw(sender_dilithium_pub_path)
-        sig = ub64(payload['dilithium_sig'])
-        try:
-            ok = dilithium_verify(dil_pub, ct2, sig)
-            if not ok:
-                raise ValueError('Dilithium signature invalid')
-        except TypeError:
-            # some APIs raise on invalid
-            try:
-                dilithium_verify(sig, dil_pub, ct2)
-            except Exception:
-                raise ValueError('Dilithium signature invalid')
-
-    # optional SPHINCS verify
-    if use_sphincs and SPHINCS_AVAILABLE and payload.get('sphincs_sig'):
-        try:
-            sph_sig = ub64(payload['sphincs_sig'])
-            pyspx.sphincs.verify(sph_sig, ct2)
-        except Exception:
-            raise ValueError('SPHINCS signature verification failed')
-
-    # decrypt layers
     nonce_aes = ub64(payload['nonce_aes'])
     aesgcm = AESGCM(key_aes)
     ct1 = aesgcm.decrypt(nonce_aes, ct2, None)
@@ -398,63 +238,60 @@ def decrypt(payload: dict, recipient_x25519_priv_path: str, recipient_kyber_priv
     plaintext = chacha.decrypt(nonce_chacha, ct1, None)
     return plaintext
 
-# ---------------- CLI ----------------
+# ----------------- CLI -----------------
 
 def main():
-    parser = argparse.ArgumentParser(description='Maximum-security hybrid classical + PQC encryptor (Kyber1024 + Dilithium5)')
-    parser.add_argument('--gen-keys', action='store_true')
-    parser.add_argument('--id', help='prefix for keys')
-    parser.add_argument('--mode', choices=['encrypt', 'decrypt'])
-    parser.add_argument('--infile')
-    parser.add_argument('--outfile')
-    parser.add_argument('--recipient_x25519_pub')
-    parser.add_argument('--recipient_kyber_pub')
-    parser.add_argument('--recipient_x25519_priv')
-    parser.add_argument('--recipient_kyber_priv')
-    parser.add_argument('--sender_ed_priv')
-    parser.add_argument('--sender_dilithium_priv')
-    parser.add_argument('--sender_ed_pub')
-    parser.add_argument('--sender_dilithium_pub')
-    parser.add_argument('--use_sphincs', action='store_true', help='Enable SPHINCS+ signatures as extra fallback')
+    parser = argparse.ArgumentParser(description='Secure layered hybrid encryptor')
+    parser.add_argument('--gen-keys', action='store_true', help='Generate keypairs for recipient and sender')
+    parser.add_argument('--recipient-id', help='Prefix for recipient key files when generating')
+    parser.add_argument('--sender-id', help='Prefix for sender key files when generating')
+    parser.add_argument('--protect-password', help='Optional password to protect generated private keys (scrypt-based)')
+
+    parser.add_argument('--mode', choices=['encrypt', 'decrypt'], help='Mode')
+    parser.add_argument('--infile', help='Input file (plaintext for encrypt, JSON for decrypt)')
+    parser.add_argument('--outfile', help='Output file (JSON for encrypt, plaintext for decrypt)')
+    parser.add_argument('--recipient', help='Recipient public (encrypt) or private (decrypt) key path')
+    parser.add_argument('--sender', help='Sender private (encrypt) or public (decrypt) key path')
+    parser.add_argument('--password', help='Password to decrypt protected private keys (if applicable)')
 
     args = parser.parse_args()
 
     if args.gen_keys:
-        if not args.id:
-            parser.error('--gen-keys requires --id')
-        gen_all_keys(args.id)
+        if not args.recipient_id or not args.sender_id:
+            parser.error('--gen-keys requires --recipient-id and --sender-id')
+        gen_keypair_x25519(args.recipient_id, protect_password=args.protect_password)
+        gen_keypair_ed25519(args.sender_id, protect_password=args.protect_password)
         return
 
     if args.mode == 'encrypt':
-        if not args.infile or not args.recipient_x25519_pub or not args.sender_ed_priv:
-            parser.error('encrypt requires --infile --recipient_x25519_pub --sender_ed_priv')
+        if not args.infile or not args.recipient or not args.sender:
+            parser.error('encrypt requires --infile --recipient (recipient X25519 pub) --sender (sender Ed25519 priv)')
         plaintext = open(args.infile, 'rb').read()
-        payload = encrypt(plaintext, args.recipient_x25519_pub, args.recipient_kyber_pub, args.sender_ed_priv, args.sender_dilithium_priv, use_sphincs=args.use_sphincs)
-        out = json.dumps(payload)
+        recipient_pub = load_x25519_public(args.recipient)
+        sender_priv = load_ed25519_private(args.sender, password=args.password)
+        payload = encrypt(plaintext, recipient_pub, sender_priv)
+        out_json = json.dumps(payload)
         if args.outfile:
-            open(args.outfile, 'w').write(out)
+            open(args.outfile, 'w').write(out_json)
             print(f'Wrote encrypted JSON to {args.outfile}')
         else:
-            print(out)
-        return
+            print(out_json)
 
-    if args.mode == 'decrypt':
-        if not args.infile or not args.recipient_x25519_priv or not args.sender_ed_pub:
-            parser.error('decrypt requires --infile --recipient_x25519_priv --sender_ed_pub')
+    elif args.mode == 'decrypt':
+        if not args.infile or not args.recipient or not args.sender:
+            parser.error('decrypt requires --infile --recipient (recipient X25519 priv) --sender (sender Ed25519 pub)')
         payload = json.load(open(args.infile, 'r'))
-        plaintext = decrypt(payload, args.recipient_x25519_priv, args.recipient_kyber_priv, args.sender_ed_pub, args.sender_dilithium_pub, use_sphincs=args.use_sphincs)
+        recipient_priv = load_x25519_private(args.recipient, password=args.password)
+        sender_pub = load_ed25519_public(args.sender)
+        plaintext = decrypt(payload, recipient_priv, sender_pub)
         if args.outfile:
             open(args.outfile, 'wb').write(plaintext)
             print(f'Wrote plaintext to {args.outfile}')
         else:
             print(plaintext.decode('utf-8', errors='replace'))
-        return
 
-    parser.print_help()
+    else:
+        parser.print_help()
 
 if __name__ == '__main__':
-    if not PQC_AVAILABLE:
-        print('WARNING: PQC libraries not fully available. Install: pip install pqcrypto pyspx')
-    else:
-        print('PQC support: ' + ', '.join([k for k,v in [('Kyber',KYBER_AVAILABLE),('Dilithium',DILITHIUM_AVAILABLE),('SPHINCS',SPHINCS_AVAILABLE)] if v]))
-    main()
+    main(
